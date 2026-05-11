@@ -1,0 +1,62 @@
+# NordVPN (OpenVPN) tunnel + SOCKS5 proxy for Atlas access.
+#
+# Runs Gluetun (qmcgaw/gluetun) as the NordVPN client because this account's
+# dedicated IP only supports OpenVPN. A SOCKS5 sidecar shares the VPN's
+# network namespace and exposes 127.0.0.1:1080 on the host so Mongo drivers
+# can use ?proxyHost=127.0.0.1&proxyPort=1080 against the Atlas SRV URIs.
+#
+# Containerised apps that need DB access can join the same netns with
+#     network_mode: "service:vpn"
+# and use the unmodified mongodb+srv:// URI -- no proxy options needed.
+
+services:
+  vpn:
+    image: qmcgaw/gluetun:latest
+    container_name: nordvpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: nordvpn
+      VPN_TYPE: openvpn
+      # NordVPN *service* credentials (Manual Setup page), NOT the account login.
+      OPENVPN_USER: ${NORDVPN_USER:?set NORDVPN_USER in .env}
+      OPENVPN_PASSWORD: ${NORDVPN_PASSWORD:?set NORDVPN_PASSWORD in .env}
+      # Pin to your dedicated-IP server (the `remote` line in the .ovpn file).
+      # Comma-separated if more than one.
+      SERVER_HOSTNAMES: ${NORDVPN_SERVER:?set NORDVPN_SERVER in .env}
+      OPENVPN_PROTOCOL: udp
+      # Let local subnets bypass the kill-switch so the host can hit 127.0.0.1:1080
+      # and other containers on the bridge can reach the SOCKS port.
+      FIREWALL_OUTBOUND_SUBNETS: 192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      # Allow inbound on the SOCKS port through Gluetun's firewall.
+      FIREWALL_INPUT_PORTS: "1080"
+      TZ: ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:1080:1080"
+    restart: unless-stopped
+
+  socks5:
+    image: serjs/go-socks5-proxy:latest
+    container_name: nordvpn-socks5
+    network_mode: "service:vpn"
+    depends_on:
+      - vpn
+    environment:
+      PROXY_PORT: 1080
+      # Bound to 127.0.0.1 on the host, so leaving auth off is acceptable.
+      # To require auth instead, set REQUIRE_AUTH=true and provide PROXY_USER/PROXY_PASSWORD.
+      REQUIRE_AUTH: "false"
+      # PROXY_USER: ${SOCKS_USER}
+      # PROXY_PASSWORD: ${SOCKS_PASSWORD}
+    restart: unless-stopped
+
+  # Example app sidecar -- uncomment and adapt. No proxy needed; it shares the VPN netns.
+  # app:
+  #   image: your-app:latest
+  #   network_mode: "service:vpn"
+  #   depends_on:
+  #     - vpn
+  #   environment:
+  #     MONGODB_URI: mongodb+srv://USER:PASS@<cluster-01>.<atlas-id>.mongodb.net/?retryWrites=true&w=majority
